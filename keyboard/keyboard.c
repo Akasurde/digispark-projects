@@ -13,6 +13,16 @@
 
 #include "usbdrv.h"
 
+#define MSG_BUFFER_SIZE 32
+#define MOD_SHIFT_LEFT (1<<1)
+#define STATE_SEND 1
+#define STATE_DONE 0
+#define NUM_LOCK 1
+#define CAPS_LOCK 2
+#define SCROLL_LOCK 4
+
+PROGMEM const char password[] = "abhijeet";
+
 // ************************
 // *** USB HID ROUTINES ***
 // ************************
@@ -63,35 +73,38 @@ typedef struct {
 static keyboard_report_t keyboard_report; // sent to PC
 volatile static uchar LED_state = 0xff; // received from PC
 static uchar idleRate; // repeat rate for keyboards
+static uchar messageState = STATE_DONE;
+static uchar messageBuffer[MSG_BUFFER_SIZE] = "";
+static uchar messagePtr = 0;
+static uchar messageCharNext = 1;
 
 usbMsgLen_t usbFunctionSetup(uchar data[8]) {
-	usbRequest_t *rq = (void *)data;
+    usbRequest_t *rq = (void *)data;
 
-	if ((rq->bmRequestType & USBRQ_TYPE_MASK) == USBRQ_TYPE_CLASS) {
-		switch (rq->bRequest) {
-			case USBRQ_HID_GET_REPORT: // send "no keys pressed" if asked here
-				// wValue: ReportType (highbyte), ReportID (lowbyte)
-				usbMsgPtr = (void *)&keyboard_report; // we only have this one
-				keyboard_report.modifier = 0;
-				keyboard_report.keycode[0] = 0;
-				return sizeof(keyboard_report);
-			case USBRQ_HID_SET_REPORT: // if wLength == 1, should be LED state
-				return (rq->wLength.word == 1) ? USB_NO_MSG : 0;
-			case USBRQ_HID_GET_IDLE: // send idle rate to PC as required by spec
-				usbMsgPtr = &idleRate;
-				return 1;
-			case USBRQ_HID_SET_IDLE: // save idle rate as required by spec
-				idleRate = rq->wValue.bytes[1];
-				return 0;
-		}
-	}
+    if ((rq->bmRequestType & USBRQ_TYPE_MASK) == USBRQ_TYPE_CLASS) {
+        switch (rq->bRequest) {
+            case USBRQ_HID_GET_REPORT: // send "no keys pressed" if asked here
+                // wValue: ReportType (highbyte), ReportID (lowbyte)
+                usbMsgPtr = (void *)&keyboard_report; // we only have this one
+                keyboard_report.modifier = 0;
+                keyboard_report.keycode[0] = 0;
+                return sizeof(keyboard_report);
+            case USBRQ_HID_SET_REPORT: // if wLength == 1, should be LED state
+                return (rq->wLength.word == 1) ? USB_NO_MSG : 0;
+            case USBRQ_HID_GET_IDLE: // send idle rate to PC as required by spec
+                usbMsgPtr = &idleRate;
+                return 1;
+            case USBRQ_HID_SET_IDLE: // save idle rate as required by spec
+                idleRate = rq->wValue.bytes[1];
+                return 0;
+        }
+    }
 
     return 0; // by default don't return any data
 }
 
-#define NUM_LOCK 1
-#define CAPS_LOCK 2
-#define SCROLL_LOCK 4
+
+void caps_toggle();
 
 usbMsgLen_t usbFunctionWrite(uint8_t * data, uchar len) {
 	if (data[0] == LED_state)
@@ -99,30 +112,81 @@ usbMsgLen_t usbFunctionWrite(uint8_t * data, uchar len) {
 	else
 		LED_state = data[0];
 
-	if (LED_state & CAPS_LOCK)
+	if (LED_state & CAPS_LOCK) {
 		PORTB |= _BV(PB1); // LED on
-	else
+        caps_toggle();
+    } else {
 		PORTB &= ~_BV(PB1); // LED off
-
+    }
 	return 1; // Data read, not expecting more
 }
 
-// Now only supports letters 'a' to 'z' and 0 (NULL) to clear buttons
-void buildReport(uchar send_key) {
-	keyboard_report.modifier = 0;
-
-	if (send_key >= 'a' && send_key <= 'z')
-		keyboard_report.keycode[0] = 4+(send_key-'a');
-	else
-		keyboard_report.keycode[0] = 0;
+void caps_toggle() {
+    memcpy_P(messageBuffer, password, sizeof(password));
+    messagePtr = 0;
+    messageState = STATE_SEND;
 }
 
-#define STATE_WAIT 0
-#define STATE_SEND_KEY 1
-#define STATE_RELEASE_KEY 2
+uchar buildReport() {
+    uchar ch;
+
+    if(messageState == STATE_DONE || messagePtr >= sizeof(messageBuffer) || messageBuffer[messagePtr] == 0) {
+        keyboard_report.modifier = 0;
+        keyboard_report.keycode[0] = 0;
+        return STATE_DONE;
+    }
+
+    if(messageCharNext) { // send a keypress
+        ch = messageBuffer[messagePtr++];
+
+        // convert character to modifier + keycode
+        if(ch >= '0' && ch <= '9') {
+            keyboard_report.modifier = 0;
+            keyboard_report.keycode[0] = (ch == '0') ? 39 : 30+(ch-'1');
+        } else if(ch >= 'a' && ch <= 'z') {
+            keyboard_report.modifier = (LED_state & 2) ? MOD_SHIFT_LEFT : 0;
+            keyboard_report.keycode[0] = 4+(ch-'a');
+        } else if(ch >= 'A' && ch <= 'Z') {
+            keyboard_report.modifier = (LED_state & 2) ? 0 : MOD_SHIFT_LEFT;
+            keyboard_report.keycode[0] = 4+(ch-'A');
+        } else {
+            keyboard_report.modifier = 0;
+            keyboard_report.keycode[0] = 0;
+            switch(ch) {
+            case '.':
+                keyboard_report.keycode[0] = 0x37;
+                break;
+            case '_':
+                keyboard_report.modifier = MOD_SHIFT_LEFT;
+            case '-':
+                keyboard_report.keycode[0] = 0x2D;
+                break;
+            case ' ':
+                keyboard_report.keycode[0] = 0x2C;
+                break;
+            case '\t':
+                keyboard_report.keycode[0] = 0x2B;
+                break;
+            case '\n':
+                keyboard_report.keycode[0] = 0x28;
+                break;
+            }
+        }
+    } else { // key release before the next keypress!
+        keyboard_report.modifier = 0;
+        keyboard_report.keycode[0] = 0;
+    }
+
+    messageCharNext = !messageCharNext; // invert
+
+    return STATE_SEND;
+}
 
 int main() {
-	uchar i, button_release_counter = 0, state = STATE_SEND_KEY;
+    uchar i, state = STATE_SEND;
+    memcpy_P(messageBuffer, password, sizeof(password));
+    messagePtr = 0;
+    messageState = STATE_SEND;
 
 	DDRB |= _BV(DDB1);
 
@@ -134,12 +198,12 @@ int main() {
 	usbInit();
 
 	usbDeviceDisconnect(); // enforce re-enumeration
-	
+
 	for (i=0; i<250; i++) { // wait 500 ms
 		wdt_reset(); // keep the watchdog happy
 		_delay_ms(2);
 	}
-	
+
 	usbDeviceConnect();
 
 	TCCR0B |= (1 << CS01); // timer 0 at clk/8 will generate randomness
@@ -150,26 +214,12 @@ int main() {
 		wdt_reset(); // keep the watchdog happy
 		usbPoll();
 
-        	if (usbInterruptIsReady() && state != STATE_WAIT && LED_state != 0xff) {
-			switch(state) {
-				case STATE_SEND_KEY:
-					buildReport('x');
-					state = STATE_RELEASE_KEY; // release next
-					PORTB |= _BV(PB1);
-					break;
-				case STATE_RELEASE_KEY:
-					buildReport(NULL);
-					state = STATE_WAIT; // go back to waiting
-					PORTB &= ~_BV(PB1);
-					break;
-				default:
-					state = STATE_WAIT; // should not happen
-			}
-
-			// start sending
-			usbSetInterrupt((void *)&keyboard_report, sizeof(keyboard_report));
-        	}
-    	}
+        if (usbInterruptIsReady() && state == STATE_SEND && LED_state != 0xff) {
+            // start sending
+            messageState = buildReport();
+            usbSetInterrupt((void *)&keyboard_report, sizeof(keyboard_report));
+        }
+    }
 
     return 0;
 }
